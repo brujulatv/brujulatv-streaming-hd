@@ -1,368 +1,280 @@
+const NodeMediaServer = require('node-media-server');
 const express = require('express');
-const cors = require('cors');
 const path = require('path');
+const cors = require('cors');
+const helmet = require('helmet');
+const { v4: uuidv4 } = require('uuid');
 const fs = require('fs');
-const { spawn } = require('child_process');
+require('dotenv').config();
 
+// Configuración del servidor
 const app = express();
 const PORT = process.env.PORT || 3000;
+const RTMP_PORT = process.env.RTMP_PORT || 1935;
+const HTTP_MEDIA_PORT = process.env.HTTP_MEDIA_PORT || 8000;
 
-// Middleware
-app.use(cors());
-app.use(express.json());
+// Middlewares de seguridad y configuración
+app.use(helmet({
+  contentSecurityPolicy: false,
+  crossOriginEmbedderPolicy: false
+}));
+app.use(cors({
+  origin: ['http://localhost:3000', 'http://localhost:8000'],
+  credentials: true
+}));
 app.use(express.static('public'));
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
-// Variables globales
-let ffmpegProcess = null;
-let streamStatus = 'stopped';
-let streamInfo = {
-    title: 'BrujulaTV Colombia',
-    description: 'Streaming HD desde Colombia',
-    viewerCount: 0,
-    isLive: false,
-    startTime: null
+// Crear directorios necesarios
+const createDirectories = () => {
+  const dirs = ['./media', './public', './logs'];
+  dirs.forEach(dir => {
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+      console.log(`📁 Directorio creado: ${dir}`);
+    }
+  });
 };
 
-// Servir archivos estáticos
-app.use('/hls', express.static(path.join(__dirname, 'hls')));
+// Configuración avanzada del servidor RTMP
+const config = {
+  rtmp: {
+    port: RTMP_PORT,
+    chunk_size: 60000,
+    gop_cache: true,
+    ping: 30,
+    ping_timeout: 60
+  },
+  http: {
+    port: HTTP_MEDIA_PORT,
+    mediaroot: './media',
+    allow_origin: '*'
+  },
+  hls: {
+    mediaroot: './media',
+    segment: 3,
+    flags: '[hls_time=2:hls_list_size=3:hls_flags=delete_segments]'
+  },
+  dash: {
+    mediaroot: './media',
+    segment: 3,
+    flags: '[f=dash:window_size=3:extra_window_size=5]'
+  },
+  fission: {
+    ffmpeg: '/usr/local/bin/ffmpeg',
+    tasks: [
+      {
+        rule: "live/*",
+        model: [
+          {
+            ab: "128k",
+            vb: "1000k",
+            vs: "1280x720",
+            vf: "30"
+          },
+          {
+            ab: "96k", 
+            vb: "500k",
+            vs: "854x480",
+            vf: "24"
+          }
+        ]
+      }
+    ]
+  }
+};
 
-// Ruta principal - Página del canal
+// Variables globales para tracking
+let activeStreams = new Map();
+let streamStats = new Map();
+
+// Crear servidor RTMP
+const nms = new NodeMediaServer(config);
+
+// Eventos del servidor RTMP con logging mejorado
+nms.on('preConnect', (id, args) => {
+  const timestamp = new Date().toISOString();
+  console.log(`🔄 [${timestamp}] PreConnect: ID=${id}`);
+  console.log(`📡 Args:`, JSON.stringify(args, null, 2));
+});
+
+nms.on('postConnect', (id, args) => {
+  const timestamp = new Date().toISOString();
+  console.log(`✅ [${timestamp}] PostConnect: ID=${id}`);
+  
+  // Guardar información de conexión
+  activeStreams.set(id, {
+    id,
+    connected: timestamp,
+    ip: args.ip || 'unknown',
+    status: 'connected'
+  });
+});
+
+nms.on('doneConnect', (id, args) => {
+  const timestamp = new Date().toISOString();
+  console.log(`❌ [${timestamp}] DoneConnect: ID=${id}`);
+  
+  // Remover de streams activos
+  activeStreams.delete(id);
+  streamStats.delete(id);
+});
+
+nms.on('prePublish', (id, StreamPath, args) => {
+  const timestamp = new Date().toISOString();
+  console.log(`🎥 [${timestamp}] PrePublish: ID=${id}`);
+  console.log(`📺 StreamPath: ${StreamPath}`);
+  console.log(`🔧 Args:`, JSON.stringify(args, null, 2));
+  
+  // Aquí puedes agregar autenticación
+  const streamKey = StreamPath.split('/').pop();
+  console.log(`🔑 Stream Key: ${streamKey}`);
+  
+  // Validación básica de stream key (opcional)
+  const validKeys = ['brujulatv', 'test', 'live', 'stream'];
+  if (!validKeys.includes(streamKey)) {
+    console.log(`❌ Stream Key inválida: ${streamKey}`);
+    // return null; // Descomenta para rechazar streams inválidas
+  }
+});
+
+nms.on('postPublish', (id, StreamPath, args) => {
+  const timestamp = new Date().toISOString();
+  console.log(`🔴 [${timestamp}] STREAM INICIADO`);
+  console.log(`📺 StreamPath: ${StreamPath}`);
+  console.log(`🆔 Stream ID: ${id}`);
+  
+  // Actualizar información del stream
+  if (activeStreams.has(id)) {
+    const streamInfo = activeStreams.get(id);
+    streamInfo.streamPath = StreamPath;
+    streamInfo.publishStarted = timestamp;
+    streamInfo.status = 'publishing';
+    activeStreams.set(id, streamInfo);
+  }
+  
+  // Iniciar tracking de estadísticas
+  streamStats.set(id, {
+    startTime: Date.now(),
+    viewers: 0,
+    totalBytes: 0
+  });
+  
+  console.log(`🌐 URLs disponibles:`);
+  console.log(`   RTMP: rtmp://localhost:${RTMP_PORT}${StreamPath}`);
+  console.log(`   FLV:  http://localhost:${HTTP_MEDIA_PORT}${StreamPath}.flv`);
+  console.log(`   HLS:  http://localhost:${HTTP_MEDIA_PORT}${StreamPath}/index.m3u8`);
+});
+
+nms.on('donePublish', (id, StreamPath, args) => {
+  const timestamp = new Date().toISOString();
+  console.log(`⭕ [${timestamp}] STREAM TERMINADO`);
+  console.log(`📺 StreamPath: ${StreamPath}`);
+  console.log(`🆔 Stream ID: ${id}`);
+  
+  // Limpiar información del stream
+  if (activeStreams.has(id)) {
+    const streamInfo = activeStreams.get(id);
+    streamInfo.publishEnded = timestamp;
+    streamInfo.status = 'disconnected';
+  }
+  
+  streamStats.delete(id);
+});
+
+// Rutas del servidor web mejoradas
 app.get('/', (req, res) => {
-    res.send(`
-<!DOCTYPE html>
-<html lang="es">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>BrujulaTV Colombia - Streaming HD</title>
-    <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { 
-            font-family: 'Arial', sans-serif; 
+  const streamCount = activeStreams.size;
+  const publishingStreams = Array.from(activeStreams.values()).filter(s => s.status === 'publishing');
+  
+  res.send(`
+    <!DOCTYPE html>
+    <html lang="es">
+      <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>BrujulaTV - Servidor de Streaming HD</title>
+        <style>
+          * { margin: 0; padding: 0; box-sizing: border-box; }
+          body { 
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; 
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
             color: white; 
             min-height: 100vh;
-        }
-        .container { max-width: 1200px; margin: 0 auto; padding: 20px; }
-        .header { text-align: center; margin-bottom: 30px; }
-        .header h1 { font-size: 3em; margin-bottom: 10px; text-shadow: 2px 2px 4px rgba(0,0,0,0.5); }
-        .header p { font-size: 1.2em; opacity: 0.9; }
-        .video-container { 
-            background: rgba(0,0,0,0.3); 
-            border-radius: 15px; 
-            padding: 20px; 
-            margin-bottom: 30px;
-            box-shadow: 0 8px 32px rgba(0,0,0,0.3);
-        }
-        video { 
-            width: 100%; 
-            max-width: 800px; 
-            border-radius: 10px; 
-            box-shadow: 0 4px 20px rgba(0,0,0,0.5);
-        }
-        .status { 
-            text-align: center; 
-            margin: 20px 0; 
-            padding: 15px;
+            padding: 20px;
+          }
+          .container { 
+            max-width: 1200px; 
+            margin: 0 auto; 
             background: rgba(255,255,255,0.1);
-            border-radius: 10px;
-        }
-        .live-indicator { 
-            display: inline-block; 
-            background: #ff4444; 
-            color: white; 
-            padding: 5px 15px; 
-            border-radius: 20px; 
-            font-weight: bold;
-            animation: pulse 2s infinite;
-        }
-        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.7; } }
-        .info-grid { 
-            display: grid; 
-            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); 
-            gap: 20px; 
-            margin-top: 30px;
-        }
-        .info-card { 
-            background: rgba(255,255,255,0.1); 
-            padding: 20px; 
-            border-radius: 10px; 
+            backdrop-filter: blur(10px);
+            border-radius: 20px;
+            padding: 30px;
+            box-shadow: 0 8px 32px rgba(0,0,0,0.3);
+          }
+          .header {
             text-align: center;
-        }
-        .info-card h3 { margin-bottom: 10px; color: #ffd700; }
-        .controls { text-align: center; margin: 20px 0; }
-        .btn { 
-            background: #4CAF50; 
-            color: white; 
-            border: none; 
-            padding: 12px 24px; 
-            border-radius: 25px; 
-            cursor: pointer; 
-            margin: 0 10px;
-            font-size: 16px;
-            transition: all 0.3s;
-        }
-        .btn:hover { background: #45a049; transform: translateY(-2px); }
-        .btn.stop { background: #f44336; }
-        .btn.stop:hover { background: #da190b; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <div class="header">
-            <h1>🎬 BrujulaTV Colombia</h1>
-            <p>Transmisión en vivo desde Colombia</p>
-        </div>
-        
-        <div class="video-container">
-            <center>
-                <video id="video" controls autoplay muted>
-                    Tu navegador no soporta video HTML5.
-                </video>
-            </center>
-        </div>
-        
-        <div class="status" id="status">
-            <div class="live-indicator" id="liveIndicator" style="display: none;">🔴 EN VIVO</div>
-            <p id="statusText">Preparando transmisión...</p>
-        </div>
-        
-        <div class="controls">
-            <button class="btn" onclick="checkStream()">🔄 Actualizar</button>
-            <button class="btn" onclick="toggleFullscreen()">📺 Pantalla Completa</button>
-        </div>
-        
-        <div class="info-grid">
-            <div class="info-card">
-                <h3>📊 Estado del Stream</h3>
-                <p id="streamStatus">Desconectado</p>
-            </div>
-            <div class="info-card">
-                <h3>👥 Espectadores</h3>
-                <p id="viewerCount">0</p>
-            </div>
-            <div class="info-card">
-                <h3>⏰ Tiempo en vivo</h3>
-                <p id="liveTime">--:--:--</p>
-            </div>
-            <div class="info-card">
-                <h3>🌍 Calidad</h3>
-                <p>HD 1080p</p>
-            </div>
-        </div>
-    </div>
-
-    <script>
-        const video = document.getElementById('video');
-        const statusText = document.getElementById('statusText');
-        const liveIndicator = document.getElementById('liveIndicator');
-        const streamStatus = document.getElementById('streamStatus');
-        
-        let hls;
-        let checkInterval;
-        
-        function initPlayer() {
-            if (Hls.isSupported()) {
-                hls = new Hls({
-                    enableWorker: true,
-                    lowLatencyMode: true,
-                    backBufferLength: 90
-                });
-                
-                hls.loadSource('/hls/stream.m3u8');
-                hls.attachMedia(video);
-                
-                hls.on(Hls.Events.MANIFEST_PARSED, function() {
-                    statusText.textContent = '✅ Stream conectado - Reproduciendo';
-                    liveIndicator.style.display = 'inline-block';
-                    streamStatus.textContent = 'Conectado';
-                });
-                
-                hls.on(Hls.Events.ERROR, function(event, data) {
-                    if (data.fatal) {
-                        statusText.textContent = '❌ Error de conexión - Reintentando...';
-                        liveIndicator.style.display = 'none';
-                        streamStatus.textContent = 'Error';
-                        setTimeout(checkStream, 5000);
-                    }
-                });
-            } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-                video.src = '/hls/stream.m3u8';
-            } else {
-                statusText.textContent = '❌ Tu navegador no soporta HLS';
-            }
-        }
-        
-        function checkStream() {
-            fetch('/api/status')
-                .then(response => response.json())
-                .then(data => {
-                    if (data.isLive) {
-                        initPlayer();
-                        document.getElementById('viewerCount').textContent = data.viewerCount;
-                        updateLiveTime(data.startTime);
-                    } else {
-                        statusText.textContent = '📴 Stream sin señal';
-                        liveIndicator.style.display = 'none';
-                        streamStatus.textContent = 'Desconectado';
-                    }
-                })
-                .catch(error => {
-                    statusText.textContent = '🔄 Buscando señal...';
-                    setTimeout(checkStream, 3000);
-                });
-        }
-        
-        function updateLiveTime(startTime) {
-            if (!startTime) return;
-            
-            setInterval(() => {
-                const now = new Date();
-                const start = new Date(startTime);
-                const diff = now - start;
-                
-                const hours = Math.floor(diff / 3600000);
-                const minutes = Math.floor((diff % 3600000) / 60000);
-                const seconds = Math.floor((diff % 60000) / 1000);
-                
-                document.getElementById('liveTime').textContent = 
-                    \`\${hours.toString().padStart(2, '0')}:\${minutes.toString().padStart(2, '0')}:\${seconds.toString().padStart(2, '0')}\`;
-            }, 1000);
-        }
-        
-        function toggleFullscreen() {
-            if (video.requestFullscreen) {
-                video.requestFullscreen();
-            } else if (video.webkitRequestFullscreen) {
-                video.webkitRequestFullscreen();
-            }
-        }
-        
-        // Inicializar
-        checkStream();
-        setInterval(checkStream, 10000);
-        
-        // Simular espectadores
-        setInterval(() => {
-            const current = parseInt(document.getElementById('viewerCount').textContent);
-            const change = Math.floor(Math.random() * 3) - 1;
-            const newCount = Math.max(0, current + change);
-            document.getElementById('viewerCount').textContent = newCount;
-        }, 30000);
-    </script>
-</body>
-</html>
-    `);
-});
-
-// API para estado del stream
-app.get('/api/status', (req, res) => {
-    res.json(streamInfo);
-});
-
-// API para iniciar stream
-app.post('/api/start-stream', (req, res) => {
-    if (streamStatus === 'running') {
-        return res.json({ success: false, message: 'Stream ya está activo' });
-    }
-    
-    startFFmpegStream();
-    res.json({ success: true, message: 'Stream iniciado' });
-});
-
-// API para detener stream
-app.post('/api/stop-stream', (req, res) => {
-    stopFFmpegStream();
-    res.json({ success: true, message: 'Stream detenido' });
-});
-
-// Función para iniciar FFmpeg
-function startFFmpegStream() {
-    // Crear directorio HLS si no existe
-    const hlsDir = path.join(__dirname, 'hls');
-    if (!fs.existsSync(hlsDir)) {
-        fs.mkdirSync(hlsDir, { recursive: true });
-    }
-    
-    // Comando FFmpeg optimizado para streaming
-    const ffmpegArgs = [
-        '-f', 'lavfi',
-        '-i', 'testsrc2=size=1920x1080:rate=30',
-        '-f', 'lavfi', 
-        '-i', 'sine=frequency=1000:sample_rate=48000',
-        '-c:v', 'libx264',
-        '-preset', 'veryfast',
-        '-tune', 'zerolatency',
-        '-crf', '23',
-        '-maxrate', '4000k',
-        '-bufsize', '8000k',
-        '-c:a', 'aac',
-        '-b:a', '128k',
-        '-f', 'hls',
-        '-hls_time', '6',
-        '-hls_list_size', '10',
-        '-hls_flags', 'delete_segments',
-        '-hls_segment_filename', path.join(hlsDir, 'segment_%03d.ts'),
-        path.join(hlsDir, 'stream.m3u8')
-    ];
-    
-    ffmpegProcess = spawn('ffmpeg', ffmpegArgs);
-    
-    ffmpegProcess.stdout.on('data', (data) => {
-        console.log(\`FFmpeg stdout: \${data}\`);
-    });
-    
-    ffmpegProcess.stderr.on('data', (data) => {
-        console.log(\`FFmpeg stderr: \${data}\`);
-    });
-    
-    ffmpegProcess.on('close', (code) => {
-        console.log(\`FFmpeg process exited with code \${code}\`);
-        streamStatus = 'stopped';
-        streamInfo.isLive = false;
-    });
-    
-    streamStatus = 'running';
-    streamInfo.isLive = true;
-    streamInfo.startTime = new Date().toISOString();
-    
-    console.log('✅ Stream iniciado con FFmpeg');
-}
-
-// Función para detener FFmpeg
-function stopFFmpegStream() {
-    if (ffmpegProcess) {
-        ffmpegProcess.kill('SIGTERM');
-        ffmpegProcess = null;
-    }
-    
-    streamStatus = 'stopped';
-    streamInfo.isLive = false;
-    streamInfo.startTime = null;
-    
-    console.log('⏹️ Stream detenido');
-}
-
-// Limpiar al cerrar
-process.on('SIGINT', () => {
-    stopFFmpegStream();
-    process.exit(0);
-});
-
-process.on('SIGTERM', () => {
-    stopFFmpegStream();
-    process.exit(0);
-});
-
-// Iniciar servidor
-app.listen(PORT, () => {
-    console.log(\`🚀 BrujulaTV Server running on port \${PORT}\`);
-    console.log(\`📺 Visit: http://localhost:\${PORT}\`);
-    console.log(\`🎬 Stream URL: http://localhost:\${PORT}/hls/stream.m3u8\`);
-    
-    // Auto-iniciar stream en desarrollo
-    if (process.env.NODE_ENV !== 'production') {
-        setTimeout(startFFmpegStream, 3000);
-    }
-});
+            margin-bottom: 40px;
+            border-bottom: 2px solid rgba(255,255,255,0.2);
+            padding-bottom: 20px;
+          }
+          .logo {
+            font-size: 3em;
+            font-weight: bold;
+            background: linear-gradient(45deg, #ff6b6b, #4ecdc4);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            margin-bottom: 10px;
+          }
+          .status { 
+            background: linear-gradient(135deg, #2d5a27, #4CAF50); 
+            padding: 25px; 
+            border-radius: 15px; 
+            margin: 20px 0; 
+            border-left: 5px solid #4CAF50;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.2);
+          }
+          .info { 
+            background: linear-gradient(135deg, #1e3a5f, #3498db); 
+            padding: 20px; 
+            border-radius: 15px; 
+            margin: 15px 0; 
+            border-left: 5px solid #3498db;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.2);
+          }
+          .warning {
+            background: linear-gradient(135deg, #8B4513, #FF8C00);
+            padding: 20px;
+            border-radius: 15px;
+            margin: 15px 0;
+            border-left: 5px solid #FF8C00;
+          }
+          .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 20px;
+            margin-top: 30px;
+          }
+          code { 
+            background: rgba(0,0,0,0.3); 
+            padding: 8px 12px; 
+            border-radius: 8px; 
+            font-family: 'Courier New', monospace;
+            border: 1px solid rgba(255,255,255,0.2);
+          }
+          .metric {
+            display: inline-block;
+            background: rgba(255,255,255,0.1);
+            padding: 10px 15px;
+            border-radius: 25px;
+            margin: 5px;
+            font-weight: bold;
+          }
+          .btn {
+            display: inline-block;
+            background: linear-gradient(135deg, #667eea, #764ba2);
+            color: white;
+            padding: 12px 25px;
+            text-decoration: none;
+            border-radius: 25px;
